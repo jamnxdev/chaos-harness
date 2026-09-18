@@ -80,9 +80,9 @@ class TargetSystemTest(unittest.TestCase):
         self.assertEqual(seen, {1, 2, 3})
 
     def test_stop_terminates_every_subprocess(self):
-        pids = list(self.system.processes.values())
+        procs = [sup.process for sup in self.system.supervisors.values()]
         self.system.stop()
-        for proc in pids:
+        for proc in procs:
             self.assertIsNotNone(proc.poll())
 
 

@@ -37,8 +37,8 @@ class HealthProbeTest(unittest.TestCase):
         probe = HealthProbe(self.system.component_url("replica-2"), poll_interval=0.02).start()
         try:
             self.assertIsNotNone(probe.wait_for(True, timeout=3.0))
-            self.system.processes["replica-2"].kill()
-            self.system.processes["replica-2"].wait()
+            self.system.supervisor("replica-2").process.kill()
+            self.system.supervisor("replica-2").process.wait()
             observed_at = probe.wait_for(False, timeout=3.0)
             self.assertIsNotNone(observed_at, "probe never observed the killed replica as unhealthy")
         finally:
@@ -53,8 +53,8 @@ class HealthProbeTest(unittest.TestCase):
         ).start()
         try:
             self.assertIsNotNone(probe.wait_for(True, timeout=3.0))
-            self.system.processes["replica-3"].kill()
-            self.system.processes["replica-3"].wait()
+            self.system.supervisor("replica-3").process.kill()
+            self.system.supervisor("replica-3").process.wait()
             self.assertIsNotNone(probe.wait_for(False, timeout=3.0))
             self.assertIn(False, transitions)
         finally:
