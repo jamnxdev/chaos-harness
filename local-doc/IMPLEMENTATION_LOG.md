@@ -161,3 +161,146 @@ when unsure which way to go) rather than silently deviating. Decisions confirmed
 - Day 7 (out of scope for this pass): README, architecture diagram, blog post, CV bullets.
 
 ---
+
+## 2026-09-18 — Day 2: Process supervisor, process-kill injector, recovery-timeline recording
+
+### Process supervisor (`harness/supervisor.py`)
+
+- **`ComponentSupervisor`** — the piece the target system was missing to make a
+  process-kill fault meaningful at all: without a container runtime's restart policy,
+  killing a process would just leave it dead forever, and there would be nothing to
+  measure "recovery" against. One background thread per component blocks on
+  `Popen.wait()` and, if the exit wasn't requested via `stop()`, waits a short
+  `restart_delay` and respawns via a caller-supplied factory closure, tracking a
+  `restart_count`.
+  - `stop()` sets an "intentional stop" flag *before* terminating the process, so the
+    watch thread's own `wait()` returning doesn't trigger a spurious respawn on
+    shutdown — verified directly by `test_stop_does_not_trigger_a_restart` (stops a
+    component, waits long enough that an incorrect auto-restart would have already
+    happened, asserts it's still dead with `restart_count == 0`).
+  - Only the watch thread ever calls `Popen.wait()` on a given process object — `stop()`
+    only `terminate()`s and then joins the watch thread, rather than also calling
+    `wait()` itself, specifically to avoid two threads racing on the same `Popen`'s
+    internal wait/lock state.
+
+### `TargetSystem` refactored to use supervisors, not bare `Popen`s
+
+- Every component (`replica-1..3`, `kv-store`, `load-balancer`) is now wrapped in its
+  own `ComponentSupervisor` instead of a raw `subprocess.Popen`. `pid(name)` now reads
+  through to the supervisor's *current* process, since that PID changes after every
+  restart — callers that cached a PID before this change would have gone stale silently,
+  which is exactly the bug class the process-kill injector needs to avoid (see below).
+- This is a breaking change to `TargetSystem`'s public shape (`processes` dict replaced
+  by `supervisors`), so the Day 1 tests (`test_target_system.py`, `test_probe.py`) were
+  updated in the same session to go through `system.supervisor(name).process` instead of
+  the old `system.processes[name]`. Re-ran the full Day 1 suite after the refactor to
+  confirm nothing regressed — still green.
+
+### Process-kill injector (`harness/injectors/process_kill.py`)
+
+- **`FaultInjector`** (`harness/injectors/base.py`) — a tiny common interface
+  (`inject(target_component, **kwargs) -> InjectionResult`) every injector will implement,
+  so the Day 4/5 scheduler can drive process-kill, network-impairment, and
+  resource-pressure identically without branching on fault type.
+- **`ProcessKillInjector`** — looks up the target component's *current* PID through its
+  supervisor (not a PID cached earlier, for the staleness reason above) and sends a real
+  `os.kill(pid, SIGKILL)`. No simulated failure anywhere in this path — the spec's own
+  design-decision section is explicit that the whole project's credibility rests on this.
+
+### Recovery-timeline recorder (`harness/recorder.py`)
+
+- **`ResultRecorder`** — SQLite (stdlib `sqlite3`, no dependency) results database, one
+  `trials` row per trial: run id, fault type, target component, wall-clock injection time,
+  `detected`/`recovered` booleans, `detection_latency_ms`/`recovery_time_ms` (nullable —
+  a trial where the probe never saw the fault, or never saw recovery, stores `NULL` rather
+  than a fabricated number). This is the spec's "results database" MUST BUILD item, chosen
+  over a flat CSV specifically because Day 5's full batches (≥20 trials × 3 fault types)
+  and Day 6's report generator both want to filter/query by fault type, which SQL makes
+  trivial and CSV would need re-parsing for every time.
+
+### Trial runner (`harness/trial_runner.py`)
+
+- **`TrialRunner`** — the literal implementation of the spec's data-flow paragraph:
+  confirm the target is healthy first (refuses to run a trial against an already-unhealthy
+  component, since that would produce a meaningless or even negative detection latency) →
+  inject the fault → poll for the first unhealthy transition (`detection_latency_ms`) →
+  if detected, poll for the return to healthy (`recovery_time_ms`) → record the trial →
+  stabilization pause before returning, so one trial's aftermath can't contaminate the
+  next trial's baseline-healthy check (the spec's own experimental-design requirement).
+  - Both `wait_for` calls have hard timeouts (`detection_timeout`, `recovery_timeout`), so
+    a fault that never resolves records as `detected=False`/`recovered=False` with a note,
+    rather than hanging the whole harness — the same "never hang forever" discipline the
+    probe's own `wait_for` was built with on Day 1, now applied one level up.
+
+### Tests
+
+- **`test_supervisor.py`** (3 cases) — a killed process gets a new PID within a few
+  hundred ms and `restart_count` increments; `stop()` does not trigger a restart; a
+  restarted replica answers `/health` again (not just "some process exists").
+- **`test_recorder.py`** (4 cases) — a recorded trial round-trips correctly through
+  SQLite; `trials_for()` filters by fault type; an undetected trial stores `NULL`
+  latencies rather than `0` or a sentinel; a recorder reopened against the same DB file
+  sees previously recorded rows (proving persistence, not just in-process caching).
+- **`test_process_kill_injector.py`** (4 cases) — `inject()` causes a real, different PID
+  to own the component's name afterward; a full trial against a replica records both
+  detection and recovery with `recovery_time_ms >= detection_latency_ms`; a 5-trial batch
+  against one replica all detect and recover; a kill against the singleton `kv-store` (no
+  load balancer masking it) is also detected and recovered. This is the test that proves
+  the whole Day 2 data flow works end to end against the real target system, not just that
+  each class compiles in isolation.
+- Full suite: **21 tests, 0 failures** (`python3 -m unittest discover -s tests`).
+
+### First small batch of trials (informal, per the spec's own Day 2 scope — not the ≥20-trial statistical batches, that's Day 5)
+
+Ran 10 process-kill trials each against `replica-1` and the singleton `kv-store`
+(`restart_delay=0.02s`, probe `poll_interval=0.02s`, one-off manual script, not committed
+as a permanent script since Day 5's scheduler will supersede it):
+
+```
+replica-1 (process-kill): n=10 detected=10 recovered=10
+  detection_ms: median=20.18 min=20.08 max=20.31
+  recovery_ms:  median=100.75 min=80.35 max=121.12
+kv-store (process-kill):  n=10 detected=10 recovered=10
+  detection_ms: median=20.24 min=20.13 max=20.30
+  recovery_ms:  median=100.55 min=80.55 max=100.87
+```
+
+- **Detection latency clusters tightly around 20ms — exactly the probe's
+  `poll_interval`.** Expected and worth flagging honestly now rather than at Day 6: with a
+  20ms poll interval, the probe can only ever report "unhealthy" up to ~20ms after the
+  fact, so detection latency here is really measuring "one poll interval," not the health
+  check's own responsiveness. A real headline result will need either a much shorter poll
+  interval or an explicit statement that detection latency is bounded below by the polling
+  interval — a direct answer to the spec's own difficult-follow-up question ("how do you
+  know your health probe polling interval itself isn't dominating your measured detection
+  latency?").
+- **Recovery time (~100ms median) is dominated by `restart_delay` (20ms) plus the new
+  Python process's own startup/bind time**, not by anything the fault-injection mechanism
+  itself is measuring — also worth being explicit about, since a real production restart
+  policy (or a container) would have different startup overhead than a bare CPython
+  interpreter cold-starting `ThreadingHTTPServer`.
+- **`replica-1` and `kv-store` show statistically indistinguishable recovery numbers at
+  this sample size** — expected, since both are being restarted by the identical
+  supervisor mechanism; the interesting *blast-radius* difference between them (LB masks a
+  replica kill vs. a KV-store kill being a full outage) isn't visible in these numbers
+  because nothing in this batch measured LB-level availability yet. Flagged as a gap for
+  the Day 5 full batches: worth adding an LB-availability probe running *concurrently*
+  with the target-component probe, to actually capture that asymmetry.
+
+### Commits (chronological, continued)
+
+3. `Process supervisor with auto-restart, refactor TargetSystem to use it`
+4. `Process-kill injector, SQLite results recorder, trial runner, first manual batch`
+
+### Not yet built (per the 7-day plan, still ahead)
+
+- Day 3: network-impairment injector (netns + netem) — needs root; will stop and ask the
+  user for a scoped sudo/visudo setup when this is reached.
+- Day 4: resource-pressure injector via real (delegated, non-root) cgroup v2 limits;
+  scheduler to run trials unattended.
+- Day 5: full experiment batches (≥20 trials per fault type, including the LB-availability
+  gap noted above); results database (already built, will just accumulate more rows).
+- Day 6 (out of scope for this pass): statistical report generator, re-run on a real VPS.
+- Day 7 (out of scope for this pass): README, architecture diagram, blog post, CV bullets.
+
+---
