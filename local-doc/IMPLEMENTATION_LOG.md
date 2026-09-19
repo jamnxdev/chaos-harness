@@ -454,3 +454,128 @@ infrastructure instead of only the fault injectors.
 - Day 7 (out of scope for this pass): README, architecture diagram, blog post, CV bullets.
 
 ---
+
+## 2026-09-19 — Day 3: Network-impairment injector (netns + netem / hard partition)
+
+### Reaching the container's netns without a container-runtime-specific API
+
+Docker gives every container its own network namespace automatically, but doesn't
+register it under `/run/netns` the way `ip netns add` does, so plain `ip netns exec
+<name>` can't address it by name out of the box. Worked out (and verified directly,
+before writing any injector code) that `ip netns attach <label> <pid>` bind-mounts an
+*existing* process's netns (here, the container's PID-1, from `docker inspect
+.State.Pid`) under `/run/netns/<label>` — after that, `ip netns exec <label> ...` and
+`tc ... ` work against it exactly like any named namespace. This matters because it
+means the injector needs privilege for exactly `ip`/`tc` and nothing else (no
+`nsenter`, no manual `mkdir`/`ln` on `/run/netns`) — i.e., it fits inside the sudoers
+scope already granted (`NOPASSWD: /usr/sbin/ip, /usr/sbin/tc`) with no changes needed.
+- A child command run via `sudo -n ip netns exec <label> tc ...` does **not** need its
+  own separate sudo grant for `tc`, even though `tc` is a different binary: `ip netns
+  exec` itself runs as root (because sudo already elevated the outer `ip` invocation),
+  and it simply `execve()`s its argument inside the target namespace, inheriting that
+  root privilege directly — confirmed by testing it against the sudoers file exactly
+  as configured, not assumed.
+
+### Two distinct fault types, one injector class (`harness/injectors/network_impairment.py`)
+
+Per the spec's own separation of "induced network partition" from "injected latency
+(not full partition)" as different failure scenarios:
+
+- **`mode="partition"`** — `ip link set eth0 down` inside the attached netns. A hard,
+  total, both-directions loss of connectivity — chosen over `tc netem loss 100%`
+  specifically because a link-down is unambiguous (verified: outbound SYN packets
+  don't even leave the interface) where 100% netem loss can still behave subtly
+  differently depending on retransmit/ARP behavior. Records as fault_type
+  `"network-partition"`.
+- **`mode="latency"`** — `tc qdisc add dev eth0 root netem delay <ms> [loss <pct>]`.
+  Degraded, not unreachable. Records as fault_type `"network-latency"`.
+- Both share one `NetworkImpairmentInjector` class (mode fixed at construction, not
+  per-call) rather than two separate classes, since the netns-attach/detach plumbing
+  is identical either way and only the actual `tc`/`ip link` command differs.
+- **Self-healing via a `threading.Timer`**: unlike process-kill (where the supervisor
+  provides recovery automatically) or a real production system (where an operator or
+  automation would eventually fix a partition), nothing else in this harness would
+  ever remove a network fault once applied. `inject()` schedules its own `heal()` via
+  a timer after `duration_s`, so every network trial has a bounded, guaranteed
+  recovery point — the same "never hang forever" discipline as Day 1's probe
+  `wait_for` and Day 2's trial timeouts, now applied to the injector itself.
+- `heal()`/`heal_all()` are idempotent and safe to call from test cleanup regardless
+  of whether the timer already fired, specifically so a failing test can't leak a
+  netns label or a permanently-down interface into the next test.
+
+### Tests (`test_network_impairment_injector.py`, 3 cases, against the real Docker target system)
+
+- **Partition detected and self-heals**: injects a 1s partition against `replica-1`,
+  confirms the probe sees it go unhealthy, then confirms it comes back healthy no
+  earlier than `injected_at + duration_s` (proves the recovery is actually gated by
+  the timer, not some coincidental unrelated healthy blip).
+- **Full trial via `TrialRunner`**: proves `NetworkImpairmentInjector` works through
+  the exact same generic trial-running path Day 2 built for process-kill, with zero
+  changes to `TrialRunner` itself — the `FaultInjector` interface abstraction from
+  Day 2 paid for itself immediately here.
+- **Latency injection measurably slows requests without an outage**: measures raw
+  request round-trip time before/during/after a 250ms netem delay directly (not
+  through the binary health probe), proving the netem effect is real and reversible,
+  and specifically *not* relying on the probe's healthy/unhealthy signal for this one
+  — see the false-negative-rate discussion below for why that distinction matters.
+- Verified no leaked network namespaces after the full suite run (`sudo ip netns list`
+  → empty).
+- Full suite: **24 tests, 0 failures**.
+
+### First small batch (informal, 8 process-partition trials against `replica-1`) — a direct answer to one of the spec's own difficult-follow-ups
+
+```
+network-partition: n=8 detected=8 recovered=8
+  detection_ms: median=355.30 min=335.60 max=357.42
+  recovery_ms:  median=1342.59 min=1324.44 max=1346.96
+```
+
+- **Detection latency here (~355ms) is roughly 15-18x process-kill's (~20ms), and
+  this is a mechanism difference, not a "network faults are slower" finding.** A
+  killed process causes an immediate TCP RST/connection-refused, which `urlopen`
+  surfaces instantly. A link-down partition causes silent packet drops with no RST
+  and no ICMP-unreachable back to the client, so the client's own connect *timeout*
+  (the health probe's `timeout=0.3s`) has to fully elapse before the probe can call it
+  "unhealthy." This is a direct, concrete answer to the spec's own difficult
+  follow-up ("how do you know your health probe polling interval itself isn't
+  dominating your measured detection latency?") — for this fault type specifically,
+  the probe's *timeout* setting (not its poll interval) dominates the number almost
+  entirely: ~300ms of the ~355ms median is that timeout, not anything about the fault
+  itself. A citable Day 5/6 result will need to either report detection latency
+  net of the known timeout floor, or use a shorter probe timeout for network faults
+  specifically and say so explicitly.
+- **Recovery time (~1343ms) is `duration_s` (1000ms, the injector's own healing
+  timer) + detection latency (~355ms) + one more poll interval** — i.e., it is
+  measuring exactly what was configured, not discovering something about the target
+  system's resilience. This is expected and correctly attributable, unlike
+  process-kill's recovery time (which really did measure something about restart
+  speed) — worth being explicit about the difference when these numbers are
+  eventually reported side by side in the Day 6 report.
+
+### Known gap, carried forward from Day 2 and now sharper
+
+The latency-injection test above deliberately bypassed the binary health probe and
+measured raw request timing directly, specifically *because* a 250ms netem delay
+would very likely make the probe's own 0.3s timeout flip it to "unhealthy" even
+though the component is not actually down — a live demonstration of the exact
+false-negative/degraded-vs-unhealthy gap flagged back on Day 1. Still not fixed (out
+of scope for Day 3), but now there's a concrete, reproducible example of it rather
+than just a theoretical concern, which will make it a stronger, better-evidenced
+discussion point for the eventual blog post and the "what's actually different
+between 'unhealthy' and 'degraded' in your probe?" interview question.
+
+### Commits (chronological, continued)
+
+7. `Network-impairment injector: netns-attached tc netem and hard link-down partition`
+
+### Not yet built (per the 7-day plan, still ahead)
+
+- Day 4: resource-pressure injector via real (delegated, non-root) cgroup v2 limits, or
+  `stress-ng` run inside a target container via `docker exec`.
+- Day 5: full experiment batches (≥20 trials per fault type, including the LB-availability
+  gap from Day 2 and the probe-timeout-vs-detection-latency distinction from today);
+  results database (already built, will just accumulate more rows).
+- Day 6 (out of scope for this pass): statistical report generator, re-run on a real VPS.
+- Day 7 (out of scope for this pass): README, architecture diagram, blog post, CV bullets.
+
+---
