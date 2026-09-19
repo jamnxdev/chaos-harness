@@ -55,11 +55,12 @@ class KVHandler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="Single-instance stateful KV store")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, required=True)
     args = parser.parse_args()
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), KVHandler)
-    print(f"kv-store listening on {args.port} pid={os.getpid()}", file=sys.stderr, flush=True)
+    server = ThreadingHTTPServer((args.host, args.port), KVHandler)
+    print(f"kv-store listening on {args.host}:{args.port} pid={os.getpid()}", file=sys.stderr, flush=True)
     server.serve_forever()
 
 

@@ -1,0 +1,48 @@
+name: chaos-harness
+
+services:
+  replica-1:
+    build: .
+    container_name: replica-1
+    command: ["python3", "api_replica.py", "--port", "8080", "--id", "1"]
+    ports:
+      - "${REPLICA1_PORT:-9001}:8080"
+    restart: "no"
+
+  replica-2:
+    build: .
+    container_name: replica-2
+    command: ["python3", "api_replica.py", "--port", "8080", "--id", "2"]
+    ports:
+      - "${REPLICA2_PORT:-9002}:8080"
+    restart: "no"
+
+  replica-3:
+    build: .
+    container_name: replica-3
+    command: ["python3", "api_replica.py", "--port", "8080", "--id", "3"]
+    ports:
+      - "${REPLICA3_PORT:-9003}:8080"
+    restart: "no"
+
+  kv-store:
+    build: .
+    container_name: kv-store
+    command: ["python3", "kv_store.py", "--port", "8080"]
+    ports:
+      - "${KV_PORT:-9010}:8080"
+    restart: "no"
+    # Deliberately not replicated -- see kv_store.py's own module docstring.
+
+  load-balancer:
+    build: .
+    container_name: load-balancer
+    command: ["python3", "load_balancer.py", "--port", "8080",
+              "--backends", "replica-1:8080", "replica-2:8080", "replica-3:8080"]
+    ports:
+      - "${LB_PORT:-9000}:8080"
+    restart: "no"
+    depends_on:
+      - replica-1
+      - replica-2
+      - replica-3

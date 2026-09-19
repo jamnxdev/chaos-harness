@@ -55,12 +55,13 @@ def make_handler(replica_id: int):
 
 def main():
     parser = argparse.ArgumentParser(description="Stateless API replica")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--id", type=int, required=True, dest="replica_id")
     args = parser.parse_args()
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(args.replica_id))
-    print(f"replica {args.replica_id} listening on {args.port} pid={os.getpid()}", file=sys.stderr, flush=True)
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(args.replica_id))
+    print(f"replica {args.replica_id} listening on {args.host}:{args.port} pid={os.getpid()}", file=sys.stderr, flush=True)
     server.serve_forever()
 
 
