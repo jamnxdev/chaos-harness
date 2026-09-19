@@ -1,10 +1,9 @@
-"""Real process-kill fault: sends an actual SIGKILL to the target component's current
-OS PID, via the component's own ComponentSupervisor. No sleep()/simulated failure --
-the whole point of this project is that faults are real (spec's own design-decision
-section is explicit about this).
+"""Real process-kill fault: sends an actual SIGKILL to the target container's main
+process via `docker kill`. No sleep()/simulated failure -- the whole point of this
+project is that faults are real (spec's own design-decision section is explicit
+about this).
 """
-import os
-import signal
+import subprocess
 
 from harness.injectors.base import FaultInjector, InjectionResult
 from harness.launcher import TargetSystem
@@ -17,8 +16,7 @@ class ProcessKillInjector(FaultInjector):
         self.target_system = target_system
 
     def inject(self, target_component: str, **kwargs) -> InjectionResult:
-        supervisor = self.target_system.supervisor(target_component)
-        pid = supervisor.pid
         injected_at = self.now()
-        os.kill(pid, signal.SIGKILL)
+        subprocess.run(["docker", "kill", "--signal=SIGKILL", target_component],
+                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return InjectionResult(fault_type=self.fault_type, target_component=target_component, injected_at=injected_at)

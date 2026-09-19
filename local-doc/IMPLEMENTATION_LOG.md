@@ -304,3 +304,153 @@ kv-store (process-kill):  n=10 detected=10 recovered=10
 - Day 7 (out of scope for this pass): README, architecture diagram, blog post, CV bullets.
 
 ---
+
+## 2026-09-19 — Docker migration: target system rebuilt on real containers
+
+### Why this happened now, not on Day 1
+
+Before starting Day 3 (network-impairment via netns/netem, which needs root), re-raised
+the earlier Day 1 environment deviation with the user rather than quietly carrying it
+forward. Confirmed answer: install Docker/`stress-ng` and set up scoped sudo properly,
+so the target system matches the spec's actual architecture instead of the plain-process
+substitute. The user ran, via `!`:
+
+```
+sudo apt update && sudo apt install -y docker.io docker-compose-plugin stress-ng
+sudo usermod -aG docker $USER
+sudo systemctl enable --now docker
+echo 'jamnxdev ALL=(root) NOPASSWD: /usr/sbin/ip, /usr/sbin/tc' | sudo tee /etc/sudoers.d/chaos-harness-netns
+sudo chmod 440 /etc/sudoers.d/chaos-harness-netns
+sudo visudo -c
+```
+
+Verified afterward: `docker ps` reachable, `docker compose` v5.5.1 present, `stress-ng
+0.17.06` installed, `sudo -n ip netns list` / `sudo -n tc qdisc show` both work
+passwordless. One session-only wrinkle: the assistant's own tool shell predates the
+`usermod -aG docker` change, so `docker` commands run from *this* tool session need an
+`sg docker -c "..."` wrapper to pick up the new group membership; a normal terminal
+opened fresh after the `usermod` does not need this. The harness code itself always
+shells out to plain `docker`/`docker compose` — the wrapper is a one-off artifact of
+this development session, not something baked into any committed script.
+
+### Target system rebuilt on Docker
+
+- **`target-system/Dockerfile`** — one shared image for all three component scripts
+  (still stdlib-only, nothing to `pip install`), differentiated per service purely via
+  each docker-compose service's `command` override.
+- **`target-system/docker-compose.yml`** — 3 `replica-N` services + `kv-store` +
+  `load-balancer`, each with an explicit `container_name` matching the component names
+  already used everywhere in the harness (`replica-1`, `kv-store`, etc.), host ports
+  overridable via env vars (`REPLICA1_PORT`, `KV_PORT`, ...) so tests could in principle
+  run an isolated stack, though in practice the whole suite currently shares one fixed
+  set of ports/names since `unittest discover` runs test modules sequentially.
+- **`api_replica.py`/`kv_store.py`/`load_balancer.py`** updated to bind `0.0.0.0` instead
+  of `127.0.0.1` — required for Docker's port-publishing NAT to reach the process inside
+  the container's own network namespace at all; a loopback-only bind would be invisible
+  from outside the container. `load_balancer.py`'s `--backend-ports` CLI flag became
+  `--backends host:port ...`, since replicas are now separate containers reachable by
+  Docker Compose's service-name DNS (`replica-1:8080`), not separate ports on one
+  shared host.
+
+### Discovery: Docker's own `restart: unless-stopped` policy is unreliable here
+
+Tested directly before trusting it: started the compose stack, `docker kill
+--signal=SIGKILL` a container declared `restart: unless-stopped`, then polled
+`docker inspect` every second for 10+ seconds. `State.Status` stayed `exited`,
+`State.Restarting` stayed `false`, `RestartCount` stayed `0` the whole time — no
+automatic restart happened, even though a manual `docker start` on the same container
+worked instantly. Re-ran the same test again on a different replica with the same
+result. Root cause not chased further (a containerd/dockerd restart-manager
+interaction specific to this box is the leading suspect, but not confirmed) — what
+matters for this project is that the policy is **not reliable enough to depend on**,
+and it later turned out to be actively harmful: once real trials started, Docker's
+own policy occasionally *did* fire (at unpredictable delay, once observed to race
+ahead of the harness's own restart), producing a container recovery whose
+`restart_count` bookkeeping came from nowhere the harness could see — a real,
+non-deterministic double-restart-mechanism bug caught via a flaky
+`test_killed_container_is_restarted_with_a_new_pid` failure (PID changed, but
+`ContainerSupervisor.restart_count` stayed `0`).
+
+**Fix**: set every service's `restart:` to `"no"` in the compose file, so recovery is
+driven by exactly one mechanism — the harness's own supervisor — and is therefore
+deterministic and fully attributable. This is the same "measure, don't assume"
+discipline the whole project is about, turned on the target system's own
+infrastructure instead of only the fault injectors.
+
+### `ContainerSupervisor` (`harness/container_supervisor.py`) replaces Day 2's `ComponentSupervisor`
+
+- Watches `docker events --filter container=<name> --filter event=die --format
+  '{{json .}}'` on a background thread (one subprocess per component) instead of
+  blocking on `Popen.wait()` (there is no `Popen` for a container's main process from
+  the host's perspective in the same sense). On a `die` event, waits `restart_delay`
+  then issues `docker start <name>`, incrementing `restart_count` — deliberately event
+  driven rather than polling `docker inspect` in a loop, both for lower latency and to
+  avoid spawning a CLI subprocess every poll tick.
+  - `pid` re-queries `docker inspect -f '{{.State.Pid}}'` fresh on every access rather
+    than caching — this is the *host*-visible PID of the container's PID-1 process
+    (containers get their own PID namespace by default, but the process is still a
+    real, killable PID from the host), so `os.kill`-style semantics still apply; the
+    injector was simplified to shell out to `docker kill` directly instead, which is
+    the more idiomatic way to signal a specific container regardless of its internal
+    PID namespace.
+- Day 2's `ComponentSupervisor` (bare-`Popen` version) was deleted outright rather than
+  kept around unused — its restart/no-restart-on-intentional-stop design directly
+  informed this version, but once the target system stopped spawning raw `Popen`s,
+  keeping the old class around would have been dead code.
+
+### `TargetSystem.start()` fixed to wait for real health, not container state
+
+- **Bug caught by test flakiness, not by inspection**: `start()` originally waited only
+  for `docker inspect`'s `State.Running` to become `true` before returning, but a
+  container can report `Running` before its Python process has finished binding its
+  listening socket. The load balancer's very first proxied requests occasionally hit a
+  replica in that gap, and urllib surfaces that specific failure mode as a raw
+  `ConnectionResetError`, not a clean "connection refused" — confusing to read from a
+  test traceback without already knowing the cause. Reproduced twice via
+  `test_load_balancer_proxies_work_requests_to_a_backend` /
+  `test_load_balancer_round_robins_across_all_replicas` failing intermittently.
+  **Fix**: `start()` now polls each component's real `/health` endpoint until it
+  answers 200 (with a timeout), not just the container's lifecycle state, before
+  returning — the target system is only considered "up" once every component can
+  actually answer traffic, which is the definition that actually matters to every
+  caller downstream (probes, injectors, trial runner).
+
+### `ProcessKillInjector` updated
+
+- Now shells out to `docker kill --signal=SIGKILL <container_name>` instead of
+  `os.kill(pid, SIGKILL)` on a cached PID — simpler and immune to the PID-namespace
+  question entirely, since `docker kill` addresses the container by name regardless of
+  its internal process tree.
+
+### Tests updated for the Docker-based target system
+
+- All of Day 1/2's test files (`test_target_system.py`, `test_probe.py`,
+  `test_process_kill_injector.py`) updated to start/stop the real Docker Compose stack
+  (via class-level `setUpClass`/`tearDownClass`, since container start/stop is much
+  slower than spawning a bare Python process — a per-test fixture would have made the
+  suite unacceptably slow) and to kill containers via `docker kill` instead of
+  `Popen.kill()`.
+- `test_supervisor.py` replaced by `test_container_supervisor.py` (2 cases): a killed
+  container gets a new PID and `restart_count` increments correctly now that Docker's
+  competing native policy is disabled; a restarted container answers `/health` again.
+- Full suite: **21 tests, 0 failures** (`sg docker -c "python3 -m unittest discover -s
+  tests"` — the `sg docker` wrapper is this tool session's own artifact, see above, not
+  part of the committed test invocation for a normal terminal).
+
+### Commits (chronological, continued)
+
+5. `Rebuild target system on Docker containers, backends addressed by host:port`
+6. `Container-based supervisor and process-kill injector; fix health-wait race in start()`
+
+### Not yet built (per the 7-day plan, still ahead)
+
+- Day 3: network-impairment injector (netns + netem) — root access confirmed working
+  (`sudo -n ip`/`sudo -n tc`); building next.
+- Day 4: resource-pressure injector via real (delegated, non-root) cgroup v2 limits, or
+  `stress-ng` run inside a target container via `docker exec`.
+- Day 5: full experiment batches (≥20 trials per fault type, including the LB-availability
+  gap noted on Day 2); results database (already built, will just accumulate more rows).
+- Day 6 (out of scope for this pass): statistical report generator, re-run on a real VPS.
+- Day 7 (out of scope for this pass): README, architecture diagram, blog post, CV bullets.
+
+---

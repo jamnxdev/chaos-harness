@@ -1,7 +1,11 @@
-"""End-to-end sanity tests against the real target system: actually starts the
-subprocesses, hits real sockets, actually stops them. No mocking of the target
-system itself — if this were faked, the whole "real fault injection" premise of the
-project would be undermined before the harness even gets involved."""
+"""End-to-end sanity tests against the real target system: actually builds and starts
+the Docker containers, hits real published ports, actually tears them down. No mocking
+of the target system itself -- if this were faked, the whole "real fault injection"
+premise of the project would be undermined before the harness even gets involved.
+
+Container start/stop is comparatively slow, so the whole stack is brought up once per
+test class (setUpClass/tearDownClass) rather than per test method.
+"""
 import json
 import time
 import unittest
@@ -14,10 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from harness.launcher import TargetSystem
 
-TEST_REPLICA_PORTS = (19001, 19002, 19003)
-TEST_KV_PORT = 19010
-TEST_LB_PORT = 19000
-
 
 def get_json(url, timeout=1.0):
     with urllib.request.urlopen(url, timeout=timeout) as resp:
@@ -25,31 +25,19 @@ def get_json(url, timeout=1.0):
 
 
 class TargetSystemTest(unittest.TestCase):
-    def setUp(self):
-        self.system = TargetSystem(TEST_REPLICA_PORTS, TEST_KV_PORT, TEST_LB_PORT).start()
-        self._wait_for_all_healthy()
+    @classmethod
+    def setUpClass(cls):
+        cls.system = TargetSystem().start()
 
-    def tearDown(self):
-        self.system.stop()
+    @classmethod
+    def tearDownClass(cls):
+        cls.system.stop()
 
-    def _wait_for_all_healthy(self, timeout=5.0):
-        deadline = time.monotonic() + timeout
-        names = ["replica-1", "replica-2", "replica-3", "kv-store", "load-balancer"]
-        while time.monotonic() < deadline:
-            try:
-                if all(get_json(f"{self.system.component_url(n)}/health")[0] == 200 for n in names):
-                    return
-            except OSError:
-                pass
-            time.sleep(0.05)
-        self.fail("target system did not become healthy in time")
-
-    def test_each_replica_reports_its_own_id_and_pid(self):
+    def test_each_replica_reports_its_own_id(self):
         for i, name in enumerate(["replica-1", "replica-2", "replica-3"], start=1):
             status, body = get_json(f"{self.system.component_url(name)}/health")
             self.assertEqual(status, 200)
             self.assertEqual(body["replica_id"], i)
-            self.assertEqual(body["pid"], self.system.pid(name))
 
     def test_kv_store_put_then_get_round_trips(self):
         url = f"{self.system.component_url('kv-store')}/kv/foo"
@@ -79,11 +67,28 @@ class TargetSystemTest(unittest.TestCase):
             seen.add(body["replica_id"])
         self.assertEqual(seen, {1, 2, 3})
 
-    def test_stop_terminates_every_subprocess(self):
-        procs = [sup.process for sup in self.system.supervisors.values()]
-        self.system.stop()
-        for proc in procs:
-            self.assertIsNotNone(proc.poll())
+    def test_container_pid_is_a_real_positive_host_pid(self):
+        for name in ["replica-1", "replica-2", "replica-3", "kv-store", "load-balancer"]:
+            self.assertGreater(self.system.pid(name), 0)
+
+
+class TargetSystemStopTest(unittest.TestCase):
+    """A dedicated start/stop cycle, separate from the shared class-level fixture
+    above, specifically to prove `stop()` actually removes every container."""
+
+    def test_stop_removes_every_container(self):
+        import subprocess
+        system = TargetSystem().start()
+        try:
+            names = ["replica-1", "replica-2", "replica-3", "kv-store", "load-balancer"]
+            for name in names:
+                self.assertGreater(system.pid(name), 0)
+        finally:
+            system.stop()
+
+        for name in ["replica-1", "replica-2", "replica-3", "kv-store", "load-balancer"]:
+            result = subprocess.run(["docker", "inspect", name], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, f"{name} should no longer exist after stop()")
 
 
 if __name__ == "__main__":
