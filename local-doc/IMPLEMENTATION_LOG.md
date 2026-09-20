@@ -579,3 +579,130 @@ between 'unhealthy' and 'degraded' in your probe?" interview question.
 - Day 7 (out of scope for this pass): README, architecture diagram, blog post, CV bullets.
 
 ---
+
+## 2026-09-20 — Day 4: Resource-pressure injector (real cgroup limits + stress-ng) + scheduler
+
+### Commit author email correction (unrelated to today's build, done first)
+
+Before starting today's work, the user asked for every commit in this repo to use
+`chovatiajaimin@gmail.com` instead of the `devxlabs.ai` address that had been used so
+far. Rewrote history with `git filter-branch --env-filter` (author+committer email
+only, every date/message/hash-otherwise preserved) across all 7 commits that existed
+at that point, after stashing the in-progress Day 4 work first so the rewrite had a
+clean tree to operate on. Verified afterward: `git log --format='%h %ae'` shows the
+corrected address on every commit.
+
+### Superseding the Day 1 cgroup-delegation finding
+
+Day 1's environment check found that cgroup v2 controllers were delegated to the
+user's own systemd slice, and reasoned that this would let resource pressure be
+applied without root. That reasoning is now moot in a different way than expected:
+since the target system runs as Docker containers (managed by `dockerd` as root, in
+`system.slice/docker-*.scope`, not the user's delegated slice), the actual mechanism
+used today is Docker's own resource limits (`cpus`/`mem_limit` in
+`docker-compose.yml`), which dockerd translates into real cgroup v2 `cpu.max`/
+`memory.max` settings on the container's cgroup. The delegated user-slice cgroups from
+Day 1 are simply not involved anymore — noted here so the two findings aren't
+confused with each other later.
+
+### `stress-ng` installed *inside* the target image, not just on the host
+
+`target-system/Dockerfile` now installs `stress-ng` in the image itself (`apt-get
+install`), so the injector can run it via `docker exec -d <container> stress-ng ...`
+directly inside the target container's own PID/cgroup namespace — contending against
+that specific container's real resource limits, not the host's.
+
+### Real resource limits added to the target containers
+
+`docker-compose.yml`: every replica and the KV store now declare `cpus: "0.5"` and
+`mem_limit: "128m"`. Verified these translate into real `HostConfig` values
+(`docker inspect` → `NanoCpus=500000000`, `Memory=134217728`) rather than trusting the
+YAML key names alone. The load balancer is deliberately left unconstrained — it's
+harness infrastructure, never itself a fault target.
+
+### `ResourcePressureInjector` (`harness/injectors/resource_pressure.py`)
+
+- **`kind="cpu"`**: `docker exec -d <container> stress-ng --cpu <workers>
+  --cpu-method all --timeout <duration_s>s`. Verified with `docker stats
+  --no-stream`: a 2-worker stress run against a container capped at `cpus: "0.5"`
+  drove measured CPU usage to ~49.7% (right at the 0.5-CPU ceiling), confirming the
+  limit is real and the stress genuinely contends against it rather than the
+  unconstrained host.
+- **`kind="memory"`**: `stress-ng --vm 1 --vm-bytes <bytes> --vm-keep --timeout
+  <duration_s>s`. `--vm-keep` holds allocated pages resident instead of
+  freeing/reallocating every iteration, so it measures sustained pressure against
+  `mem_limit`, not allocation churn.
+- **No explicit `heal()`**: unlike the network injector, `stress-ng --timeout` stops
+  itself, and `docker exec -d` returns immediately (detached) — the harness doesn't
+  need to track or cancel this fault at all, which is the simplest of the three
+  injectors built so far.
+- `is_running()` uses `docker top <container>` (host-side process listing), not
+  `docker exec ... pgrep` — caught immediately by manual testing: `pgrep` isn't
+  present in the minimal `python:3.12-slim` image and installing `procps` just for a
+  liveness check would have been unnecessary image bloat for something `docker top`
+  already answers from the host side for free.
+
+### Discovery: over-limit memory pressure OOM-kills the stress process, not the target — a real false-negative scenario, not just a hypothetical one
+
+Manually tested `--vm-bytes 150M` against a container capped at `mem_limit: "128m"`
+(above the limit, deliberately, before settling on a safe default): `docker stats`
+showed memory pinned at 128MiB/128MiB (99.99%) with heavy block I/O (thrashing), yet
+`docker inspect` reported `OOMKilled: false` for the *container*, and the target API
+process kept answering `/health` normally throughout. The cgroup OOM killer reaped the
+`stress-ng` child process specifically, not the container's PID-1 — so from the
+outside, a component that was, for a moment, genuinely thrashing at its memory limit
+looks indistinguishable from a perfectly healthy one. This is a live, reproduced
+instance of the false-negative-rate concern raised on Day 1 and sharpened on Day 3,
+not a theoretical one — good material for the eventual blog post and for the "what's
+actually different between 'unhealthy' and 'degraded' in your probe?" interview
+question. Not built further into the injector this pass (would need e.g. watching
+`docker events` for `oom` actions to detect it, which is Day 5/6-report territory at
+earliest) — the default `vm_bytes` was set safely under the limit (`100M` vs. a 128MB
+cap) specifically so this doesn't happen nondeterministically inside the committed
+test suite.
+
+### Tests (`test_resource_pressure_injector.py`, 3 cases, against the real Docker target system)
+
+- CPU pressure is real (measured via `docker stats`, not just "the command didn't
+  error") and self-terminates within its `--timeout` window.
+- Health probe stays healthy throughout moderate (2-worker, 1.5s) CPU pressure —
+  the *lack* of a false negative at this stress level, a useful contrast point
+  against the memory-OOM finding above, which the report will eventually want to
+  discuss side by side.
+- Memory pressure kept under the container's `mem_limit` does not trigger
+  `OOMKilled` — confirms the safe default actually stays safe.
+
+### `ExperimentScheduler` (`harness/scheduler.py`) — the last MUST-BUILD-adjacent piece before Day 5
+
+- A thin plan runner: `add(injector, target_component, n_trials, **inject_kwargs)`
+  queues an experiment; `run_all()` runs every queued experiment's full batch
+  sequentially (deliberately not concurrently — concurrent faults against the same
+  target system would contaminate each other's recovery measurements, which the
+  spec's experimental-design section explicitly warns against) and returns every
+  batch's records keyed by `(fault_type, target_component)`.
+- Reuses Day 2's `TrialRunner` completely unchanged — this is the second injector
+  (after `NetworkImpairmentInjector` on Day 3) to plug into the existing
+  `FaultInjector`/`TrialRunner` abstraction with zero modifications to either,
+  confirming that abstraction was worth building on Day 2.
+- Tested with a small, fast plan (`test_scheduler.py`, 1 case, 4 total trials across
+  two components) — Day 5's actual plan reuses this exact class unchanged, just
+  queuing more experiments with bigger `n_trials`.
+
+### Tests, full suite
+
+**27 tests, 0 failures** (`sg docker -c "python3 -m unittest discover -s tests"`).
+
+### Commits (chronological, continued)
+
+8. `Resource-pressure injector: real stress-ng under cgroup cpu/memory limits, scheduler`
+
+### Not yet built (per the 7-day plan, still ahead)
+
+- Day 5: full experiment batches (≥20 trials per fault type — process-kill,
+  network-partition, network-latency, cpu-pressure, memory-pressure — across the
+  relevant target components) via `ExperimentScheduler`; results persisted to the
+  SQLite recorder (already built).
+- Day 6 (out of scope for this pass): statistical report generator, re-run on a real VPS.
+- Day 7 (out of scope for this pass): README, architecture diagram, blog post, CV bullets.
+
+---

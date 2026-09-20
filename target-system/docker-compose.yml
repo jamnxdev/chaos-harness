@@ -1,5 +1,10 @@
 name: chaos-harness
 
+# cpus/mem_limit on the replicas and kv-store give the resource-pressure injector
+# (Day 4) a real, finite ceiling to contend against -- stress-ng run inside one of
+# these via `docker exec` is fighting a genuine cgroup cpu/memory limit set by
+# dockerd, not an unbounded host. The load balancer is left unconstrained since it's
+# harness infrastructure, never itself a fault target.
 services:
   replica-1:
     build: .
@@ -8,6 +13,8 @@ services:
     ports:
       - "${REPLICA1_PORT:-9001}:8080"
     restart: "no"
+    cpus: "0.5"
+    mem_limit: "128m"
 
   replica-2:
     build: .
@@ -16,6 +23,8 @@ services:
     ports:
       - "${REPLICA2_PORT:-9002}:8080"
     restart: "no"
+    cpus: "0.5"
+    mem_limit: "128m"
 
   replica-3:
     build: .
@@ -24,6 +33,8 @@ services:
     ports:
       - "${REPLICA3_PORT:-9003}:8080"
     restart: "no"
+    cpus: "0.5"
+    mem_limit: "128m"
 
   kv-store:
     build: .
@@ -32,6 +43,8 @@ services:
     ports:
       - "${KV_PORT:-9010}:8080"
     restart: "no"
+    cpus: "0.5"
+    mem_limit: "128m"
     # Deliberately not replicated -- see kv_store.py's own module docstring.
 
   load-balancer:
