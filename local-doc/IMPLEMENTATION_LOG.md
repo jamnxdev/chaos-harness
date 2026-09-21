@@ -706,3 +706,115 @@ test suite.
 - Day 7 (out of scope for this pass): README, architecture diagram, blog post, CV bullets.
 
 ---
+
+## 2026-09-21 — Day 5: Full experiment batches (≥20 trials per fault type) + results database
+
+### `run-experiments.sh` / `harness/run_experiments.py` — the spec's reproducibility requirement, built for real
+
+The spec's reproducibility section explicitly asks for "a single `run-experiments.sh`"
+alongside the scripted target-system setup — added now rather than deferred to Day 6,
+since Day 5's actual job (running the real batches) needed exactly this anyway.
+`run_experiments.py` builds one fixed plan via `ExperimentScheduler` (unchanged from
+Day 4): 20 trials each of process-kill (against `replica-1`, masked by the load
+balancer, and `kv-store`, a genuine full outage), network-partition and
+network-latency (both against `replica-2`), and cpu-pressure and memory-pressure
+(both against `replica-3`) — six fault-type/component combinations, 120 trials total,
+persisted to `results/results.db`. Target components were deliberately spread out
+(no two fault types share a component) so no fault type's results carry over
+contamination from a different fault type's recent history on the same target.
+
+### The real batch run
+
+Executed via `bash run-experiments.sh` against the full Docker-based target system
+(no shortcuts, no mocking):
+
+```
+fault_type           component      n  detected  recovered
+process-kill         replica-1     20        20         20
+process-kill         kv-store      20        20         20
+network-partition    replica-2     20        20         20
+network-latency      replica-2     20        20         20
+cpu-pressure         replica-3     20         0          0
+memory-pressure      replica-3     20         0          0
+```
+
+Full detection/recovery-latency distributions pulled from `results.db`:
+
+```
+process-kill / replica-1:   detection_ms median=233.72 p90=261.96  |  recovery_ms median=835.44 p90=871.87
+process-kill / kv-store:    detection_ms median=233.00 p90=251.23  |  recovery_ms median=823.64 p90=839.37
+network-partition/replica-2: detection_ms median=355.04 p90=357.90 |  recovery_ms median=1346.40 p90=1348.77
+network-latency / replica-2: detection_ms median=355.48 p90=358.88 |  recovery_ms median=1345.08 p90=1350.30
+cpu-pressure / replica-3:    detection_ms none (never detected)    |  recovery_ms none (never recovered)
+memory-pressure / replica-3: detection_ms none (never detected)    |  recovery_ms none (never recovered)
+```
+
+### The headline finding, stated plainly rather than smoothed over
+
+**Cpu-pressure and memory-pressure were detected in 0 of 20 trials each.** This is not
+a bug — it is the real, repeatable behavior of the current binary health probe against
+genuine, measured resource contention (Day 4's manual testing already showed this
+individually; the full 20-trial batch now confirms it isn't a fluke). The health
+check itself is cheap (a trivial HTTP handler that doesn't compete meaningfully for
+CPU or memory), so it keeps answering fast and green even while the container is
+genuinely constrained. This is the concrete, quantified version of the
+false-negative-rate metric the spec asks for (metric #4): **at these stress levels
+and with this probe design, the false-negative rate for resource-pressure faults is
+100%.** That is a real, defensible, citable number for the eventual report — a much
+stronger result than a vague "the probe might miss some things" caveat would have
+been, precisely because it's backed by a full batch, not a hunch.
+
+### A second finding: process-kill detection/recovery latency is markedly higher on Docker than the plain-process numbers from Day 2
+
+Day 2's plain-process batch (before the Docker migration) measured process-kill
+detection at ~20ms median and recovery at ~100ms median. Today's Docker-based batch,
+same fault type, same probe design, shows detection at ~234ms and recovery at
+~825-835ms — roughly 10x and 8x higher respectively. Investigated rather than assumed
+away: this isn't the fault injection mechanism getting slower, it's two additional
+infrastructure layers now sitting in the path that weren't there on Day 2 — Docker's
+own port-publishing (proxying/NAT from the host's published port to the container's
+internal socket) taking measurably longer to reflect a dead backend than a bare OS
+process's socket closing, and this project's own `ContainerSupervisor` issuing
+`docker start` (a real container start, with all of dockerd's own bookkeeping) instead
+of a bare `fork`/`exec` of a Python interpreter. Both are real, meaningful costs of the
+container-based architecture versus the plain-process fallback — not defects, but a
+concrete, measured example of the "what does containerizing actually cost you"
+question the spec's own interview-prep section invites, now backed by side-by-side
+numbers from the same project's own history rather than a general claim.
+
+### Network-partition and network-latency remain statistically indistinguishable, as predicted on Day 3
+
+Both cluster around ~355ms detection / ~1346ms recovery — confirming Day 3's own
+prediction that with the current probe's 0.3s connect timeout, a 250ms one-way netem
+delay reliably crosses that threshold just as reliably as a hard link-down does. This
+means the current experimental design cannot yet distinguish "fully down" from
+"badly degraded" using detection/recovery timing alone — both look identical to the
+probe. A future refinement (explicitly out of scope for this pass) would need either
+a probe with a shorter timeout relative to the injected delay, or a genuinely
+degraded-but-still-fast-enough latency value (e.g. 100ms instead of 250ms) to produce
+a visibly different result between the two fault types.
+
+### Results database
+
+`results/results.db` now holds 120 real trial rows across 6 fault-type/component
+combinations — the actual raw data the Day 6 report generator (out of scope for this
+pass) will read from. `.gitignore` already excludes `*.db` (set on Day 1), so this
+file is reproducible-on-demand via `run-experiments.sh` rather than committed
+directly — consistent with the spec's reproducibility section, which asks for a
+script that regenerates the data, not necessarily the data file itself committed to
+the repo.
+
+### Commits (chronological, continued)
+
+9. `Day 5: run-experiments.sh, full 120-trial batch across all fault types`
+
+### Not yet built (per the 7-day plan, out of scope for this pass)
+
+- Day 6: statistical report generator (recovery-time histograms, per-fault
+  breakdowns, the false-negative-rate finding above as a headline result); re-run on
+  a real VPS if development continued to differ from deployment.
+- Day 7: README, architecture diagram, blog post (with the Docker-migration story,
+  the netns/netem mechanism, and the 100% false-negative resource-pressure finding as
+  natural centerpieces), CV bullets, demo script.
+
+---
